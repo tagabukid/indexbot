@@ -667,12 +667,16 @@ async function buildAnalytics(){
       const holdings = await bs(`/addresses/${w.address}/token-balances`);
       for (const h of (holdings||[])){
         const tok = h.token || {};
-        if (!tok.address || Number(h.value||0) === 0) continue;
+        // Blockscout's token object uses `address_hash`, not `address` —
+        // checking tok.address was always undefined, so every token got
+        // skipped here regardless of actual balance.
+        const tokenAddr = tok.address_hash || tok.address;
+        if (!tokenAddr || tok.type !== 'ERC-20' || Number(h.value||0) === 0) continue;
         const dec = Number(tok.decimals || 18);
         const bal = Number(h.value) / Math.pow(10, dec);
-        if (!stats[tok.address]) stats[tok.address] = { symbol: tok.symbol, name: tok.name, holders:0, total:0 };
-        stats[tok.address].holders += 1;
-        stats[tok.address].total += bal;
+        if (!stats[tokenAddr]) stats[tokenAddr] = { symbol: tok.symbol, name: tok.name, holders:0, total:0 };
+        stats[tokenAddr].holders += 1;
+        stats[tokenAddr].total += bal;
       }
     } catch(e){ /* skip wallet on error, keep going */ }
     done++;
