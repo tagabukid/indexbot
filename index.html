@@ -79,6 +79,13 @@
     background: var(--bg-card-raised); color: var(--green); border: 1px solid var(--border);
     font-family: var(--font-mono); font-size: 13px; cursor: default;
   }
+  .nav-right{ display:flex; align-items:center; gap:10px; }
+  #disconnectBtn{
+    background: transparent; color: var(--red); border: 1px solid rgba(240,96,90,0.4);
+    padding: 10px 18px; border-radius: 999px; font-weight:600; font-size:13px;
+    font-family: var(--font-body); cursor:pointer; transition: background .15s ease;
+  }
+  #disconnectBtn:hover{ background: rgba(240,96,90,0.1); }
   .dot-sm{ width:6px; height:6px; border-radius:50%; background:#06150D; }
 
   main{ max-width: 1280px; margin:0 auto; padding: 0 40px 90px; }
@@ -267,6 +274,7 @@
   .tag-live{ color: var(--red); }
   .tag-err{ color: var(--red); }
   .tag-sys{ color: #6FB8E0; }
+  .tag-buy{ color: var(--green); font-weight:600; }
 
   /* ---------- Bottom CTA ---------- */
   .cta-banner{
@@ -321,7 +329,10 @@
     <a href="#settings">Settings</a>
     <a href="#activity">Activity</a>
   </div>
-  <button id="connectBtn"><span class="dot-sm"></span>Connect wallet</button>
+  <div class="nav-right">
+    <button id="connectBtn"><span class="dot-sm"></span>Connect wallet</button>
+    <button id="disconnectBtn" style="display:none">Disconnect</button>
+  </div>
 </nav>
 
 <main>
@@ -387,6 +398,7 @@
       <div class="session-stat"><span class="sl">Whale wallets tracked</span><span class="sv" id="statWhales">–</span></div>
       <div class="session-stat"><span class="sl">Coins in view</span><span class="sv" id="statCoins">–</span></div>
       <div class="session-stat"><span class="sl">Swaps detected</span><span class="sv" id="statSwaps">0</span></div>
+      <div class="session-stat"><span class="sl">New tokens spotted</span><span class="sv" id="statNewTokens">0</span></div>
       <div class="session-stat"><span class="sl">Execution mode</span><span class="sv mode-dry" id="statMode">DRY RUN</span></div>
       <button class="mini-btn" onclick="document.getElementById('settings').scrollIntoView({behavior:'smooth'})">Adjust copy-trade settings →</button>
     </div>
@@ -397,12 +409,18 @@
       <h4>Coin analytics across tracked whales</h4>
       <span class="sub" id="coinSub" style="font-size:12px; color:var(--ink-faint);">how many whales hold each coin, and how much</span>
     </div>
-    <table>
-      <thead><tr><th>Symbol</th><th>Name</th><th class="num"># whales holding</th><th class="num">Total held (approx)</th></tr></thead>
-      <tbody id="coinTable">
-        <tr><td colspan="4" class="empty-row">Load whale data first, then build analytics.</td></tr>
-      </tbody>
-    </table>
+    <div class="split" style="align-items:start;">
+      <table>
+        <thead><tr><th>Symbol</th><th>Name</th><th class="num"># whales holding</th><th class="num">Total held (approx)</th></tr></thead>
+        <tbody id="coinTable">
+          <tr><td colspan="4" class="empty-row">Load whale data first, then build analytics.</td></tr>
+        </tbody>
+      </table>
+      <div style="padding:20px 18px 8px;">
+        <div style="font-size:11.5px; color:var(--ink-faint); margin-bottom:10px;">Top coins by # whales holding</div>
+        <div style="position:relative; height:260px;"><canvas id="coinChart"></canvas></div>
+      </div>
+    </div>
     <div style="padding:16px 18px;">
       <button id="analyticsBtn" class="btn-secondary" disabled>Build coin analytics</button>
     </div>
@@ -452,6 +470,7 @@
 </footer>
 
 <script src="https://cdnjs.cloudflare.com/ajax/libs/ethers/6.13.1/ethers.umd.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.4/chart.umd.min.js"></script>
 
 <script type="module">
   // ---------- Reown AppKit (WalletConnect) ----------
@@ -484,30 +503,14 @@
     },
   });
 
-  // Exposed so the classic script below (which owns provider/signer/userAddress
-  // and the whole copy-trade logic) can trigger a Reown connection without
-  // us having to move that logic into this module.
-  window.connectViaReown = function connectViaReown(){
-    return new Promise((resolve, reject) => {
-      let settled = false;
-      const unsubscribe = appKit.subscribeProviders(async (state) => {
-        const eip155Provider = state['eip155'];
-        if (!eip155Provider || settled) return;
-        settled = true;
-        try {
-          const provider = new ethers.BrowserProvider(eip155Provider);
-          const signer = await provider.getSigner();
-          const userAddress = await signer.getAddress();
-          unsubscribe();
-          resolve({ provider, signer, userAddress, raw: eip155Provider });
-        } catch (e) {
-          unsubscribe();
-          reject(e);
-        }
-      });
-      appKit.open();
-    });
-  };
+  // Exposed to the classic script below. The modal only opens here; the classic
+  // script learns about connect AND disconnect through the 'reown-provider'
+  // event, so it also stays in sync if the user disconnects from inside the wallet.
+  window.connectViaReown = () => appKit.open();
+  window.disconnectViaReown = () => appKit.disconnect();
+  appKit.subscribeProviders((state) => {
+    window.dispatchEvent(new CustomEvent('reown-provider', { detail: state['eip155'] || null }));
+  });
 </script>
 
 <script>
@@ -528,6 +531,8 @@ let watching = false;
 let dryRun = true;
 let swapCount = 0;
 let seenTx = {};
+let knownTokens = {};   // whale address -> Set(token address) already held/seen
+let newTokenCount = 0;
 
 const $ = id => document.getElementById(id);
 function log(tag, msg){
@@ -538,57 +543,108 @@ function log(tag, msg){
   $('log').prepend(el);
 }
 
-// ---------- Wallet connect ----------
+// ---------- Wallet connect / disconnect ----------
+let rawProvider = null, usingInjected = false, injectedHooked = false;
+
+function setConnectedUI(on){
+  const b = $('connectBtn');
+  if (on){
+    b.innerHTML = '<span class="dot-sm"></span>' + userAddress.slice(0,6) + '…' + userAddress.slice(-4);
+    b.disabled = true;
+  } else {
+    b.innerHTML = '<span class="dot-sm"></span>Connect wallet';
+    b.disabled = false;
+  }
+  $('disconnectBtn').style.display = on ? '' : 'none';
+  // chainDot / chainLabel don't exist in the page — guard so this never throws.
+  const dot = $('chainDot'), lbl = $('chainLabel');
+  if (dot) dot.classList.toggle('live', on);
+  if (lbl) lbl.textContent = on ? 'chain 4663 · connected' : 'chain 4663 · not connected';
+}
+
+async function ensureChain(raw){
+  try {
+    await raw.request({ method: 'wallet_switchEthereumChain', params: [{ chainId: CHAIN_ID_HEX }] });
+  } catch (e) {
+    if (e && e.code === 4902){
+      await raw.request({
+        method: 'wallet_addEthereumChain',
+        params: [{
+          chainId: CHAIN_ID_HEX, chainName: 'Robinhood Chain',
+          nativeCurrency: { name: 'ETH', symbol: 'ETH', decimals: 18 },
+          rpcUrls: ['https://rpc.mainnet.chain.robinhood.com'],
+          blockExplorerUrls: ['https://robinhoodchain.blockscout.com'],
+        }],
+      });
+    }
+    // Some WalletConnect wallets don't support switching — AppKit already asked for this chain.
+  }
+}
+
+async function onWalletConnected(raw){
+  await ensureChain(raw);                       // switch BEFORE building the ethers provider
+  rawProvider = raw;
+  provider = new ethers.BrowserProvider(raw, 'any');
+  signer = await provider.getSigner();
+  userAddress = await signer.getAddress();
+  setConnectedUI(true);
+  log('sys', `Wallet connected: ${userAddress}`);
+}
+
+function onWalletDisconnected(){
+  if (!userAddress && !signer) return;          // already disconnected
+  provider = signer = rawProvider = userAddress = null;
+  usingInjected = false;
+  setConnectedUI(false);
+  if (!dryRun) setDryRun(true);                 // never stay LIVE without a wallet
+  log('sys', 'Wallet disconnected.');
+}
+
+window.addEventListener('reown-provider', async (e) => {
+  const raw = e.detail;
+  if (raw){
+    if (raw === rawProvider) return;
+    try { await onWalletConnected(raw); }
+    catch (err){ log('err', 'Wallet connection failed: ' + err.message); }
+  } else if (!usingInjected){
+    onWalletDisconnected();
+  }
+});
+
 $('connectBtn').addEventListener('click', async () => {
   try {
     if (window.connectViaReown){
       log('sys', 'Opening Reown wallet modal…');
-      const res = await window.connectViaReown();
-      provider = res.provider;
-      signer = res.signer;
-      userAddress = res.userAddress;
-    } else {
-      if (!window.ethereum){
-        log('err', 'No browser wallet found, and Reown did not load. Install MetaMask (or similar) and reload.');
-        return;
-      }
-      const accounts = await window.ethereum.request({ method: 'eth_requestAccounts' });
-      userAddress = accounts[0];
-      provider = new ethers.BrowserProvider(window.ethereum);
-      signer = await provider.getSigner();
+      window.connectViaReown();
+      return;
     }
-
-    try {
-      await window.ethereum?.request?.({
-        method: 'wallet_switchEthereumChain',
-        params: [{ chainId: CHAIN_ID_HEX }],
+    if (!window.ethereum){
+      log('err', 'No browser wallet found, and Reown did not load. Install MetaMask (or similar) and reload.');
+      return;
+    }
+    await window.ethereum.request({ method: 'eth_requestAccounts' });
+    usingInjected = true;
+    await onWalletConnected(window.ethereum);
+    if (!injectedHooked && window.ethereum.on){
+      injectedHooked = true;
+      window.ethereum.on('accountsChanged', (a) => {
+        if (!usingInjected) return;
+        if (!a.length) onWalletDisconnected();
+        else onWalletConnected(window.ethereum).catch(err => log('err', err.message));
       });
-    } catch (switchErr) {
-      if (switchErr && switchErr.code === 4902 && window.ethereum) {
-        await window.ethereum.request({
-          method: 'wallet_addEthereumChain',
-          params: [{
-            chainId: CHAIN_ID_HEX,
-            chainName: 'Robinhood Chain',
-            nativeCurrency: { name: 'ETH', symbol: 'ETH', decimals: 18 },
-            rpcUrls: ['https://rpc.mainnet.chain.robinhood.com'],
-            blockExplorerUrls: ['https://robinhoodchain.blockscout.com'],
-          }],
-        });
-      }
-      // Wallets connected via Reown/WalletConnect (e.g. mobile wallets) may not
-      // support wallet_switchEthereumChain at all — that's fine, AppKit already
-      // asked the wallet to use Robinhood Chain as the default network.
     }
-
-    $('connectBtn').textContent = userAddress.slice(0,6) + '…' + userAddress.slice(-4);
-    $('connectBtn').disabled = true;
-    $('chainDot').classList.add('live');
-    $('chainLabel').textContent = 'chain 4663 · connected';
-    log('sys', `Wallet connected: ${userAddress}`);
   } catch(e){
     log('err', 'Wallet connection failed: ' + e.message);
   }
+});
+
+$('disconnectBtn').addEventListener('click', async () => {
+  try {
+    if (!usingInjected && window.disconnectViaReown) await window.disconnectViaReown();
+  } catch(e){
+    log('err', 'Disconnect error: ' + e.message);
+  }
+  onWalletDisconnected();
 });
 
 // ---------- Blockscout helpers ----------
@@ -698,15 +754,46 @@ async function buildAnalytics(){
   $('coinSub').textContent = 'how many whales hold each coin, and how much';
   $('analyticsBtn').disabled = false;
   $('analyticsBtn').textContent = 'Rebuild coin analytics';
+  renderCoinChart(ranked.slice(0, 10));
   log('sys', `Analytics built across ${Object.keys(stats).length} coins.`);
+}
+
+let coinChart = null;
+function renderCoinChart(top){
+  const ctx = $('coinChart');
+  if (!ctx || typeof Chart === 'undefined') return;   // CDN blocked/offline — skip gracefully
+  if (coinChart) coinChart.destroy();
+  coinChart = new Chart(ctx, {
+    type: 'bar',
+    data: {
+      labels: top.map(t => t.symbol || '?'),
+      datasets: [{
+        label: '# whales holding',
+        data: top.map(t => t.holders),
+        backgroundColor: 'rgba(43,224,126,0.55)',
+        borderColor: '#2BE07E',
+        borderWidth: 1,
+        borderRadius: 4,
+      }]
+    },
+    options: {
+      responsive: true,
+      maintainAspectRatio: false,
+      plugins: { legend: { display: false } },
+      scales: {
+        x: { ticks: { color: '#93A29B', font: { family: 'IBM Plex Mono' } }, grid: { display: false } },
+        y: { beginAtZero: true, ticks: { color: '#93A29B', precision: 0 }, grid: { color: '#1C2A24' } },
+      }
+    }
+  });
 }
 
 $('loadBtn').addEventListener('click', () => loadWhales(Number($('whaleCount').value)||25));
 $('analyticsBtn').addEventListener('click', buildAnalytics);
 
 // ---------- Mode toggle ----------
-$('modeToggle').addEventListener('click', () => {
-  dryRun = !dryRun;
+function setDryRun(v){
+  dryRun = v;
   $('modeToggle').classList.toggle('on', !dryRun);
   const label = $('modeLabel');
   if (dryRun){
@@ -719,6 +806,14 @@ $('modeToggle').addEventListener('click', () => {
   $('statMode').textContent = dryRun ? 'DRY RUN' : 'LIVE';
   $('statMode').className = dryRun ? 'sv mode-dry' : 'sv mode-live';
   log('sys', `Mode switched to ${dryRun ? 'DRY RUN' : 'LIVE'}.`);
+}
+
+$('modeToggle').addEventListener('click', () => {
+  if (dryRun){
+    if (!signer){ log('err', 'Connect a wallet before switching to LIVE.'); return; }
+    if (!confirm('Switch to LIVE? Detected whale swaps will prompt your wallet to approve and swap with REAL funds.')) return;
+  }
+  setDryRun(!dryRun);
 });
 
 // ---------- Watch loop ----------
@@ -736,46 +831,111 @@ $('startBtn').addEventListener('click', () => {
   watchLoop();
 });
 
+let loopId = 0;
 async function watchLoop(){
-  while (watching){
+  const myLoop = ++loopId;                      // stop→start can't leave two loops running
+  while (watching && myLoop === loopId){
     for (const w of whales){
-      if (!watching) break;
+      if (!watching || myLoop !== loopId) break;
       try {
-        const data = await bs(`/addresses/${w.address}/transactions`, { filter: 'to' });
+        // filter=from → txs the whale SENT (its swaps). 'to' only returned incoming txs.
+        const data = await bs(`/addresses/${w.address}/transactions`, { filter: 'from' });
         const items = data.items || [];
         const lastSeen = seenTx[w.address];
-        const isFirstLookAtThisWallet = !lastSeen;
-        let newLast = lastSeen;
-        for (const tx of items){
-          if (tx.hash === lastSeen) break;
-          if (!newLast) newLast = tx.hash;
-          if (isFirstLookAtThisWallet) continue; // first poll: just set the baseline, don't fire on old history
-          const swap = decodeSwap(tx);
-          if (swap) await handleSwap(w.address, swap);
+        const first = lastSeen === undefined;
+        const fresh = [];
+        for (const tx of items){ if (tx.hash === lastSeen) break; fresh.push(tx); }
+        if (items.length) seenTx[w.address] = items[0].hash;
+        else if (first) seenTx[w.address] = 'none';
+        if (first){
+          log('sys', `Baseline set for ${w.address.slice(0,8)}… — will alert on swaps from here forward.`);
+          continue;                              // don't fire on old history
         }
-        if (newLast) seenTx[w.address] = newLast;
-        if (isFirstLookAtThisWallet && newLast) log('sys', `Baseline set for ${w.address.slice(0,8)}… — will alert on swaps from here forward.`);
+        for (const tx of fresh.reverse()){       // Blockscout is newest-first; copy oldest-first
+          if (tx.status && tx.status !== 'ok') continue;   // whale's swap failed on-chain
+          const swap = decodeSwap(tx);
+          if (swap){
+            await checkNewToken(w.address, swap);   // tightened: only real Uniswap swaps count
+            await handleSwap(w.address, swap);
+          }
+        }
       } catch(e){ /* skip this wallet this round */ }
     }
     await sleep(Number($('pollInterval').value||15) * 1000);
   }
 }
 
+// ---------- New token detection (tightened) ----------
+// Only fires off an ACTUAL decoded Uniswap swap on Robinhood Chain — never off a
+// bare incoming transfer (airdrop, direct send, etc). Primes the whale's current
+// ERC-20 holdings first, so pre-existing bags never get flagged as "new".
+async function primeKnownTokens(address){
+  const set = new Set();
+  try {
+    const holdings = await bs(`/addresses/${address}/token-balances`);
+    for (const h of (holdings||[])){
+      const tok = h.token || {};
+      const addr = (tok.address_hash || tok.address || '').toLowerCase();
+      if (addr && tok.type === 'ERC-20' && Number(h.value||0) > 0) set.add(addr);
+    }
+  } catch(e){ /* start empty if this fails — worst case a few false "new" flags */ }
+  knownTokens[address] = set;
+}
+
+async function getTokenMeta(addr){
+  try {
+    const data = await bs(`/tokens/${addr}`);
+    return { symbol: data.symbol || '?', name: data.name || '?' };
+  } catch(e){ return { symbol: '?', name: '?' }; }
+}
+
+async function checkNewToken(whaleAddr, swap){
+  if (!knownTokens[whaleAddr]) await primeKnownTokens(whaleAddr);
+  const known = knownTokens[whaleAddr];
+  const tOut = swap.tokenOut.toLowerCase();
+  if (known.has(tOut)) return;                    // whale already held/bought this before
+  known.add(tOut);
+  newTokenCount++;
+  $('statNewTokens').textContent = newTokenCount;
+  const meta = await getTokenMeta(swap.tokenOut);
+  log('buy', `NEW TOKEN — whale ${whaleAddr.slice(0,8)}… bought ${meta.symbol} (${meta.name}) via Uniswap swap, tx ${swap.txHash.slice(0,10)}…`);
+}
+
+// SwapRouter02 swaps usually arrive wrapped in multicall(...) (that's how ETH swaps
+// and most UI swaps are sent), so unwrap it instead of only matching a bare exactInputSingle.
+const ROUTER_IFACE = new ethers.Interface([
+  'function exactInputSingle((address tokenIn,address tokenOut,uint24 fee,address recipient,uint256 amountIn,uint256 amountOutMinimum,uint160 sqrtPriceLimitX96) params) payable returns (uint256)',
+  'function multicall(uint256 deadline, bytes[] data) payable returns (bytes[])',
+  'function multicall(bytes32 previousBlockhash, bytes[] data) payable returns (bytes[])',
+  'function multicall(bytes[] data) payable returns (bytes[])',
+]);
+
+function findSingleSwap(data, depth){
+  if (depth > 2) return null;
+  let parsed;
+  try { parsed = ROUTER_IFACE.parseTransaction({ data }); } catch(e){ return null; }
+  if (!parsed) return null;
+  if (parsed.name === 'exactInputSingle') return parsed.args[0];
+  if (parsed.name === 'multicall'){
+    for (const inner of parsed.args[parsed.args.length - 1]){
+      const r = findSingleSwap(inner, depth + 1);
+      if (r) return r;
+    }
+  }
+  return null;
+}
+
 function decodeSwap(tx){
   const to = (tx.to && tx.to.hash || '').toLowerCase();
   if (!KNOWN_ROUTERS[to]) return null;
   const data = tx.raw_input || tx.input;
-  // SwapRouter02's exactInputSingle has NO deadline field (7-field struct);
-  // its real selector is 0x04e45aaf. 0x414bf389 is the OLD SwapRouter's
-  // 8-field (with-deadline) selector and will never match SwapRouter02 calls.
-  if (!data || !data.startsWith('0x04e45aaf')) return null;
-  try {
-    const iface = new ethers.Interface(ROUTER_ABI);
-    const parsed = iface.parseTransaction({ data });
-    const p = parsed.args[0];
-    return { tokenIn: p[0], tokenOut: p[1], fee: p[2], amountIn: p[4], txHash: tx.hash };
-  } catch(e){ return null; }
+  if (!data || data === '0x') return null;
+  const p = findSingleSwap(data, 0);
+  if (!p) return null;
+  return { tokenIn: p[0], tokenOut: p[1], fee: p[2], amountIn: p[4], txHash: tx.hash };
 }
+
+const GAS_RESERVE = ethers.parseEther('0.0005');   // kept back when trading with native ETH
 
 async function handleSwap(whaleAddr, swap){
   swapCount++; $('statSwaps').textContent = swapCount; const flo=$('statSwapsFloat'); if(flo) flo.textContent = swapCount;
@@ -787,16 +947,30 @@ async function handleSwap(whaleAddr, swap){
   }
 
   try {
+    const net = await provider.getNetwork();
+    if (net.chainId !== 4663n){
+      log('err', `Wallet is on chain ${net.chainId}, not Robinhood Chain (4663) — switch network and it will resume.`);
+      return;
+    }
+
     const token = new ethers.Contract(swap.tokenIn, ERC20_ABI, provider);
-    const myBal = await token.balanceOf(userAddress);
+    // Whales trading ETH send it as msg.value and the router wraps it, so tokenIn shows
+    // up as WETH. If you hold no WETH, trade with native ETH the same way.
+    let useNative = false;
+    let myBal = await token.balanceOf(userAddress);
+    if (swap.tokenIn.toLowerCase() === WETH.toLowerCase() && myBal === 0n){
+      const ethBal = await provider.getBalance(userAddress);
+      myBal = ethBal > GAS_RESERVE ? ethBal - GAS_RESERVE : 0n;
+      useNative = true;
+    }
     const ratio = Number($('copyRatio').value||1) / 100;
     let amountIn = (myBal * BigInt(Math.floor(ratio*10000))) / 10000n;
 
     const priceUsd = await getTokenUsdPrice(swap.tokenIn);
     if (priceUsd && priceUsd > 0){
-      const decimals = await token.decimals();
+      const decimals = Number(await token.decimals());
       const maxUsd = Number($('maxTrade').value||50);
-      const capAmount = ethers.parseUnits((maxUsd / priceUsd).toFixed(Number(decimals)), decimals);
+      const capAmount = ethers.parseUnits((maxUsd / priceUsd).toFixed(decimals), decimals);
       if (capAmount < amountIn){
         amountIn = capAmount;
         log('plan', `MAX_TRADE_USD cap applied: capped to ${maxUsd} USD worth (~$${priceUsd} per token).`);
@@ -806,7 +980,7 @@ async function handleSwap(whaleAddr, swap){
     }
 
     if (amountIn === 0n){
-      log('skip', 'You hold none of the token being sold — nothing to copy.');
+      log('skip', `You hold none of the token being sold${useNative ? ' (or too little ETH after gas reserve)' : ''} — nothing to copy.`);
       return;
     }
 
@@ -815,36 +989,38 @@ async function handleSwap(whaleAddr, swap){
     const slipBps = Math.floor(Number($('slippage').value||1) * 100);
     const minOut = (expectedOut * BigInt(10000 - slipBps)) / 10000n;
 
-    log('plan', `Copy plan: amountIn=${amountIn} expectedOut=${expectedOut} minOut=${minOut}`);
+    log('plan', `Copy plan: ${useNative ? 'native ETH' : 'token'} amountIn=${amountIn} expectedOut=${expectedOut} minOut=${minOut}`);
 
     if (dryRun){
       log('plan', 'DRY RUN — no transaction sent.');
       return;
     }
+    if (!signer) return;                          // disconnected while we were sizing
 
-    log('live', 'LIVE mode — requesting wallet signature for approval + swap…');
-    const tokenWithSigner = token.connect(signer);
-    const allowance = await token.allowance(userAddress, SWAP_ROUTER_02);
-    if (allowance < amountIn){
-      const approveTx = await tokenWithSigner.approve(SWAP_ROUTER_02, amountIn);
-      await approveTx.wait();
+    log('live', 'LIVE mode — requesting wallet signature' + (useNative ? ' for swap…' : ' for approval + swap…'));
+    if (!useNative){
+      const allowance = await token.allowance(userAddress, SWAP_ROUTER_02);
+      if (allowance < amountIn){
+        const approveTx = await token.connect(signer).approve(SWAP_ROUTER_02, amountIn);
+        log('live', `Approval submitted: ${approveTx.hash}`);
+        await approveTx.wait();
+      }
     }
     const router = new ethers.Contract(SWAP_ROUTER_02, ROUTER_ABI, signer);
-    const tx = await router.exactInputSingle([swap.tokenIn, swap.tokenOut, swap.fee, userAddress, amountIn, minOut, 0]);
+    const tx = await router.exactInputSingle(
+      [swap.tokenIn, swap.tokenOut, swap.fee, userAddress, amountIn, minOut, 0],
+      { value: useNative ? amountIn : 0n }
+    );
     log('live', `Submitted: ${tx.hash}`);
     await tx.wait();
     log('live', `Confirmed: ${tx.hash}`);
   } catch(e){
-    log('err', 'Copy trade failed: ' + e.message);
+    log('err', 'Copy trade failed: ' + (e.shortMessage || e.message));
   }
 }
 
 function sleep(ms){ return new Promise(r => setTimeout(r, ms)); }
 </script>
-
-</body>
-</html>
-
 
 </body>
 </html>
