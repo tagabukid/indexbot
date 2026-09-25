@@ -570,9 +570,9 @@
   async function initReown(){
     if (!window.__walletEnvOk) return; // already warned above, don't even try
 
-    let createAppKit, defineChain, EthersAdapter;
+    let createAppKit, EthersAdapter;
     try {
-      ({ createAppKit, defineChain } = await import('https://esm.sh/@reown/appkit'));
+      ({ createAppKit } = await import('https://esm.sh/@reown/appkit'));
       ({ EthersAdapter } = await import('https://esm.sh/@reown/appkit-adapter-ethers'));
     } catch (err) {
       const msg = 'Failed to load Reown AppKit module (' + (err && err.message ? err.message : err) +
@@ -583,7 +583,14 @@
       return;
     }
 
-    const robinhoodChain = defineChain({
+    // NOTE: we deliberately do NOT import `defineChain` from '@reown/appkit/networks'.
+    // That subpath is bundled on the fly by esm.sh and has proven unreliable in
+    // production (it can resolve with `defineChain` missing/undefined even though
+    // the import line itself looks correct). `defineChain` is mostly a TypeScript
+    // typing helper anyway — Reown's own docs show custom networks passed to AppKit
+    // as plain objects with this exact shape, with no defineChain call at all. So we
+    // just build the plain object directly; AppKit only inspects the shape.
+    const robinhoodChain = {
       id: 4663,
       caipNetworkId: 'eip155:4663',
       chainNamespace: 'eip155',
@@ -591,7 +598,7 @@
       nativeCurrency: { name: 'ETH', symbol: 'ETH', decimals: 18 },
       rpcUrls: { default: { http: ['https://rpc.mainnet.chain.robinhood.com'] } },
       blockExplorers: { default: { name: 'Blockscout', url: 'https://robinhoodchain.blockscout.com' } },
-    });
+    };
 
     // window.location.origin is "null" or "file://" in broken contexts —
     // fall back to something valid so createAppKit doesn't choke on it.
