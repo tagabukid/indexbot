@@ -4,6 +4,22 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>IndexBot — Robinhood Chain Whale Tracker</title>
+<script>
+  // ---------- Global error catcher (debug aid) ----------
+  // Surfaces any JS error as a visible alert so problems show up even on a
+  // phone with no access to browser dev tools. Runs before everything else.
+  window.addEventListener('error', function(e){
+    var msg = 'JS ERROR: ' + e.message + '\nfile: ' + (e.filename || '?') + '\nline: ' + e.lineno + ':' + e.colno;
+    alert(msg);
+    console.error(msg, e.error);
+  });
+  window.addEventListener('unhandledrejection', function(e){
+    var reason = e.reason && e.reason.message ? e.reason.message : e.reason;
+    var msg = 'UNHANDLED PROMISE REJECTION: ' + reason;
+    alert(msg);
+    console.error(msg, e.reason);
+  });
+</script>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;600;700&family=Inter:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500;600&display=swap" rel="stylesheet">
