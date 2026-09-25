@@ -1130,6 +1130,34 @@ async function getTokenMeta(addr){
   } catch(e){ return { symbol: '?', name: '?' }; }
 }
 
+function formatAge(deployedAt){
+  const mins = Math.floor((Date.now() - deployedAt.getTime()) / 60000);
+  if (mins < 60) return `${mins}m old`;
+  const hours = Math.floor(mins / 60);
+  if (hours < 24) return `${hours}h old`;
+  return `${Math.floor(hours / 24)}d old`;
+}
+
+// Looks up when the TOKEN CONTRACT ITSELF was deployed (its creation tx timestamp) —
+// separate from "new to this whale", which only means the whale hadn't held it before.
+// Returns null if Blockscout hasn't indexed a creation tx for it (e.g. not a contract,
+// or the lookup fails) — callers should treat that as "age unknown", not an error.
+async function getTokenDeployInfo(tokenAddr){
+  try {
+    const addrInfo = await bs(`/addresses/${tokenAddr}`);
+    const creationTxHash = addrInfo && addrInfo.creation_transaction_hash;
+    if (!creationTxHash) return null;
+    const tx = await bs(`/transactions/${creationTxHash}`);
+    if (!tx || !tx.timestamp) return null;
+    const deployedAt = new Date(tx.timestamp);
+    return {
+      deployedAt,
+      ageLabel: formatAge(deployedAt),
+      freshlyDeployed: (Date.now() - deployedAt.getTime()) < 24 * 60 * 60 * 1000,
+    };
+  } catch(e){ return null; }
+}
+
 async function checkNewToken(whaleAddr, swap){
   if (!knownTokens[whaleAddr]) await primeKnownTokens(whaleAddr);
   const known = knownTokens[whaleAddr];
@@ -1139,7 +1167,10 @@ async function checkNewToken(whaleAddr, swap){
   newTokenCount++;
   $('statNewTokens').textContent = newTokenCount;
   const meta = await getTokenMeta(swap.tokenOut);
-  log('buy', `NEW TOKEN — whale ${whaleAddr.slice(0,8)}… bought ${meta.symbol} (${meta.name}) via Uniswap swap, tx ${swap.txHash.slice(0,10)}…`);
+  const deployInfo = await getTokenDeployInfo(swap.tokenOut);
+  const ageNote = deployInfo ? ` — contract is ${deployInfo.ageLabel}` : ' — contract age unknown';
+  const freshTag = deployInfo && deployInfo.freshlyDeployed ? '🔥 FRESH DEPLOY — ' : '';
+  log('buy', `${freshTag}NEW TOKEN — whale ${whaleAddr.slice(0,8)}… bought ${meta.symbol} (${meta.name}) via Uniswap swap${ageNote}, tx ${swap.txHash.slice(0,10)}…`);
 }
 
 // SwapRouter02 swaps usually arrive wrapped in multicall(...) (that's how ETH swaps
