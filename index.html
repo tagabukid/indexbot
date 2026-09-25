@@ -213,6 +213,7 @@
   th{
     text-align:left; padding: 12px 18px; font-size: 11px; font-weight: 600;
     letter-spacing:0.02em; color: var(--ink-faint); border-bottom: 1px solid var(--border);
+    position: sticky; top: 0; background: var(--bg-card); z-index: 1;
   }
   td{ padding: 13px 18px; font-size: 13.5px; font-family: var(--font-mono); border-bottom: 1px solid var(--border-soft); }
   td.label{ font-family: var(--font-body); }
@@ -405,12 +406,14 @@
         <h4>Top wallets by balance</h4>
         <span class="sub" id="whaleSub" style="font-size:12px; color:var(--ink-faint);">Blockscout · sorted by balance</span>
       </div>
-      <table>
-        <thead><tr><th class="rank">#</th><th>Address</th><th class="num">ETH balance</th><th class="num">Txs</th></tr></thead>
-        <tbody id="whaleTable">
-          <tr><td colspan="4" class="empty-row">Click "Load whale data" below to fetch the current top wallets.</td></tr>
-        </tbody>
-      </table>
+      <div style="max-height: 360px; overflow-y: auto;">
+        <table>
+          <thead><tr><th class="rank">#</th><th>Address</th><th class="num">ETH balance</th><th class="num">Txs</th></tr></thead>
+          <tbody id="whaleTable">
+            <tr><td colspan="4" class="empty-row">Click "Load whale data" below to fetch the current top wallets.</td></tr>
+          </tbody>
+        </table>
+      </div>
       <div style="padding:16px 18px; display:flex; gap:12px; align-items:center;">
         <button id="loadBtn" class="btn-secondary">Load whale data</button>
         <input id="whaleCount" type="number" value="25" min="5" max="100" class="num-input" style="width:70px;">
@@ -470,6 +473,26 @@
       <div class="field" id="maxTradeField"><label>Max trade size</label><input id="maxTrade" type="number" value="50"> USD</div>
       <div class="field"><label>Slippage tolerance</label><input id="slippage" type="number" value="1" step="0.1"> %</div>
       <div class="field"><label>Poll interval</label><input id="pollInterval" type="number" value="15"> sec</div>
+      <div class="field"><label>Stop-loss</label><input id="stopLossPct" type="number" value="10" step="0.5" min="0"> %</div>
+      <div class="field"><label>Take-profit</label><input id="takeProfitPct" type="number" value="25" step="0.5" min="0"> %</div>
+    </div>
+    <div style="padding:0 18px 16px; display:flex; align-items:center; gap:10px;">
+      <label style="display:flex; align-items:center; gap:8px; font-size:13px; color:var(--ink-dim); cursor:pointer;">
+        <input type="checkbox" id="autoSellEnabled">
+        Auto-sell on stop-loss / take-profit (LIVE mode only — checks price every refresh cycle)
+      </label>
+    </div>
+    <div style="padding:0 18px 16px; display:flex; align-items:center; gap:10px;">
+      <label style="display:flex; align-items:center; gap:8px; font-size:13px; color:var(--ink-dim); cursor:pointer;">
+        <input type="checkbox" id="includeHistory">
+        Show each whale's last 10 past buys when watching starts (informational only — never copy-traded)
+      </label>
+    </div>
+    <div style="padding:0 18px 16px; display:flex; align-items:center; gap:10px;">
+      <label style="display:flex; align-items:center; gap:8px; font-size:13px; color:var(--ink-dim); cursor:pointer;">
+        <input type="checkbox" id="watchPonsGrads">
+        Alert on new Pons graduations (bonding curve → Uniswap v4) — detection only, no auto-buy
+      </label>
     </div>
     <div class="mode-row">
       <div class="toggle-wrap">
@@ -649,6 +672,15 @@ const WETH = "0x0Bd7D308f8E1639FAb988df18A8011f41EAcAD73";
 const SWAP_ROUTER_02 = "0xcaf681a66d020601342297493863e78c959e5cb2";
 const QUOTER_V2 = "0x33e885ed0ec9bf04ecfb19341582aadcb4c8a9e7";
 const KNOWN_ROUTERS = { [SWAP_ROUTER_02.toLowerCase()]: "Uniswap SwapRouter02" };
+
+// ---------- Pons launchpad (graduation detection) ----------
+// Pons tokens launch on their own bonding curve, then "graduate" into a Uniswap v4
+// pool once the curve hits its threshold. The factory below emits PoolGraduated the
+// moment that happens — this is read-only detection, no swap logic (Pons pools are
+// Uniswap v4 with a custom fee hook, which SwapRouter02 above cannot trade).
+const PONS_FACTORY = "0x7ed598bcef8bd9edd8c97a195c6d13f40801ec7e";
+const POOL_GRADUATED_TOPIC0 = "0x0a44ef75df69c534f43cd6c1aa3ef8983065fe5fe79ef9e79f6494e6f258c259";
+let seenPonsGradTx = undefined;   // baseline, same pattern as seenTx for whales
 
 const ROUTER_ABI = ["function exactInputSingle((address tokenIn,address tokenOut,uint24 fee,address recipient,uint256 amountIn,uint256 amountOutMinimum,uint160 sqrtPriceLimitX96) params) payable returns (uint256 amountOut)"];
 const QUOTER_ABI = ["function quoteExactInputSingle((address tokenIn,address tokenOut,uint256 amountIn,uint24 fee,uint160 sqrtPriceLimitX96) params) returns (uint256 amountOut,uint160,uint32,uint256)"];
@@ -1040,6 +1072,7 @@ $('startBtn').addEventListener('click', () => {
     $('startBtn').textContent = 'Start watching';
     log('sys', 'Stopped watching.');
     stopAutoAnalytics();
+    stopAutoSellMonitor();
     return;
   }
   if (whales.length === 0){ log('err', 'Load whale data first.'); return; }
@@ -1048,7 +1081,24 @@ $('startBtn').addEventListener('click', () => {
   log('sys', `Watching ${whales.length} wallets every ${$('pollInterval').value}s for swaps…`);
   watchLoop();
   if ($('autoAnalytics').checked) startAutoAnalytics();
+  startAutoSellMonitor();
 });
+
+// ---------- Auto-sell monitor loop ----------
+// Independent of the whale-watching loop: periodically refreshes prices on open
+// positions and checks them against stop-loss / take-profit while watching is on.
+let autoSellTimer = null;
+function startAutoSellMonitor(){
+  if (autoSellTimer) return;
+  autoSellTimer = setInterval(async () => {
+    if (!watching || !$('autoSellEnabled').checked) return;
+    await refreshPerformance();   // updates trade.currentPriceUsd for every open trade
+    await checkAutoSell();
+  }, 20000);   // every 20s — independent of the whale poll interval
+}
+function stopAutoSellMonitor(){
+  if (autoSellTimer){ clearInterval(autoSellTimer); autoSellTimer = null; }
+}
 
 // ---------- Auto-refresh analytics while watching ----------
 let analyticsTimer = null;
@@ -1076,6 +1126,7 @@ let loopId = 0;
 async function watchLoop(){
   const myLoop = ++loopId;                      // stop→start can't leave two loops running
   while (watching && myLoop === loopId){
+    await checkPonsGraduations();   // once per cycle, independent of the whale list
     for (const w of whales){
       if (!watching || myLoop !== loopId) break;
       try {
@@ -1090,6 +1141,9 @@ async function watchLoop(){
         else if (first) seenTx[w.address] = 'none';
         if (first){
           log('sys', `Baseline set for ${w.address.slice(0,8)}… — will alert on swaps from here forward.`);
+          if ($('includeHistory').checked){
+            await logHistoricalSwaps(w.address, items);
+          }
           continue;                              // don't fire on old history
         }
         for (const tx of fresh.reverse()){       // Blockscout is newest-first; copy oldest-first
@@ -1104,6 +1158,85 @@ async function watchLoop(){
     }
     await sleep(Number($('pollInterval').value||15) * 1000);
   }
+}
+
+// ---------- Pons graduation detection (read-only) ----------
+// Called once per watch cycle (not per-whale). Looks at the Pons factory's own log
+// history for PoolGraduated events. Same "baseline first, then alert forward" pattern
+// as whale watching: the first pass just records where we are, so you don't get
+// flooded with every graduation that already happened before you started watching.
+async function checkPonsGraduations(){
+  if (!$('watchPonsGrads').checked) return;
+  try {
+    const data = await bs(`/addresses/${PONS_FACTORY}/logs`);
+    const items = data.items || [];
+    const grads = items.filter(it => (it.topics && it.topics[0] || '').toLowerCase() === POOL_GRADUATED_TOPIC0);
+    const lastSeen = seenPonsGradTx;
+    const first = lastSeen === undefined;
+    const fresh = [];
+    for (const it of grads){ if (it.transaction_hash === lastSeen) break; fresh.push(it); }
+    if (grads.length) seenPonsGradTx = grads[0].transaction_hash;
+    else if (first) seenPonsGradTx = 'none';
+    if (first){
+      log('sys', 'Pons graduation baseline set — will alert on new graduations from here forward.');
+      return;
+    }
+    for (const it of fresh.reverse()){
+      // token is the only indexed arg on PoolGraduated — topics[1], padded to 32 bytes
+      let tokenAddr = it.topics && it.topics[1] ? '0x' + it.topics[1].slice(-40) : null;
+      // prefer Blockscout's own decoding if the factory is verified there
+      if (it.decoded && it.decoded.parameters){
+        const p = it.decoded.parameters.find(p => p.name === 'token');
+        if (p && p.value) tokenAddr = p.value;
+      }
+      if (!tokenAddr) continue;
+      const meta = await getTokenMeta(tokenAddr);
+      log('buy', `🎓 GRADUATED (Pons) — ${meta.symbol} (${meta.name}) just moved from bonding curve to Uniswap v4, token ${tokenAddr.slice(0,10)}…, tx ${it.transaction_hash.slice(0,10)}…`);
+    }
+  } catch(e){ /* skip this cycle, retry next poll */ }
+}
+
+// ---------- Historical (pre-existing) swaps, informational only ----------
+// Runs once per whale, the moment its baseline is set. Looks at up to the last 10
+// already-decoded swaps this whale made BEFORE you started watching and logs them
+// for reference — these are shown as "(PAST)" and are never copy-traded, since the
+// moment to act on them has already gone by.
+async function logHistoricalSwaps(whaleAddr, items){
+  try {
+    const pastSwaps = [];
+    for (const tx of items){
+      if (tx.status && tx.status !== 'ok') continue;
+      const swap = decodeSwap(tx);
+      if (swap) pastSwaps.push(swap);
+      if (pastSwaps.length >= 10) break;         // cap: newest 10 historical swaps only
+    }
+    if (pastSwaps.length === 0) return;
+    log('sys', `Found ${pastSwaps.length} past swap(s) for ${whaleAddr.slice(0,8)}… (informational, not copy-traded):`);
+    for (const swap of pastSwaps.reverse()){     // oldest first, matches live log ordering
+      const meta = await getTokenMeta(swap.tokenOut);
+      log('plan', `(PAST) ${whaleAddr.slice(0,8)}… bought ${meta.symbol} (${meta.name}) via Uniswap, tx ${swap.txHash.slice(0,10)}…`);
+      await recordHistoricalTrade(whaleAddr, swap);
+    }
+  } catch(e){ /* best-effort only — never blocks live watching if this fails */ }
+}
+
+// Adds a past swap to the Trade Performance table so you can see it, tagged as
+// historical. dryRun stays true forever for these (sold is also true) so auto-sell
+// and the LIVE copy-trade path both ignore them completely.
+async function recordHistoricalTrade(whaleAddr, swap){
+  try {
+    const meta = await getTokenMeta(swap.tokenOut);
+    const entryPriceUsd = await getTokenUsdPrice(swap.tokenOut);
+    trades.unshift({
+      time: Date.now(), whale: whaleAddr, symbol: meta.symbol, name: meta.name,
+      tokenAddr: swap.tokenOut, amountOut: null,
+      entryPriceUsd, currentPriceUsd: entryPriceUsd, dryRun: true, txHash: swap.txHash,
+      amountOutRaw: '0', decimals: 18, fee: swap.fee, quoteToken: swap.tokenIn,
+      sold: true, soldTxHash: null, historical: true,
+    });
+    if (trades.length > 200) trades.length = 200;
+    renderTrades();
+  } catch(e){ /* skip tracking this one */ }
 }
 
 // ---------- New token detection (tightened) ----------
@@ -1322,10 +1455,95 @@ async function recordTrade(whaleAddr, swap, amountOut, isDryRun){
       time: Date.now(), whale: whaleAddr, symbol: meta.symbol, name: meta.name,
       tokenAddr: swap.tokenOut, amountOut: amountOutHuman,
       entryPriceUsd, currentPriceUsd: entryPriceUsd, dryRun: isDryRun, txHash: swap.txHash,
+      // extra fields needed only for auto-sell (stop-loss / take-profit):
+      amountOutRaw: amountOut.toString(),   // exact on-chain amount we received, as a string (BigInt)
+      decimals: outDec,
+      fee: swap.fee,                        // same Uniswap fee tier used to buy, reused to sell back
+      quoteToken: swap.tokenIn,             // the asset we paid with (usually WETH) — sell back into this
+      sold: false,
+      soldTxHash: null,
     });
     if (trades.length > 200) trades.length = 200;   // cap memory
     renderTrades();
   } catch(e){ /* skip tracking this one, doesn't affect the copy trade itself */ }
+}
+
+// ---------- Auto-sell (stop-loss / take-profit) ----------
+// Sells a previously-bought token back into whatever it was bought with (quoteToken,
+// almost always WETH), using the exact same router/fee tier as the original buy.
+async function sellToken(trade, reason){
+  if (trade.sold || trade.dryRun) return;             // never auto-sell dry-run "trades"
+  if (!signer || !userAddress){
+    log('err', `Auto-sell skipped for ${trade.symbol}: wallet not connected.`);
+    return;
+  }
+  try {
+    const net = await provider.getNetwork();
+    if (net.chainId !== 4663n){
+      log('err', `Auto-sell skipped for ${trade.symbol}: wallet not on Robinhood Chain.`);
+      return;
+    }
+    const amountIn = BigInt(trade.amountOutRaw);
+    if (amountIn <= 0n) return;
+
+    const heldToken = new ethers.Contract(trade.tokenAddr, ERC20_ABI, provider);
+    const onChainBal = await heldToken.balanceOf(userAddress);
+    const sellAmount = onChainBal < amountIn ? onChainBal : amountIn;  // don't try to sell more than we actually hold
+    if (sellAmount === 0n){
+      log('skip', `Auto-sell skipped for ${trade.symbol}: no balance found on-chain.`);
+      trade.sold = true; renderTrades();
+      return;
+    }
+
+    const quoter = new ethers.Contract(QUOTER_V2, QUOTER_ABI, provider);
+    const [expectedOut] = await quoter.quoteExactInputSingle.staticCall(
+      [trade.tokenAddr, trade.quoteToken, sellAmount, trade.fee, 0]
+    );
+    const slipBps = Math.floor(Number($('slippage').value||1) * 100);
+    const minOut = (expectedOut * BigInt(10000 - slipBps)) / 10000n;
+
+    log('live', `Auto-sell triggered (${reason}) for ${trade.symbol} — requesting wallet signature…`);
+
+    const allowance = await heldToken.allowance(userAddress, SWAP_ROUTER_02);
+    if (allowance < sellAmount){
+      const approveTx = await heldToken.connect(signer).approve(SWAP_ROUTER_02, sellAmount);
+      log('live', `Approval submitted: ${approveTx.hash}`);
+      await approveTx.wait();
+    }
+
+    const router = new ethers.Contract(SWAP_ROUTER_02, ROUTER_ABI, signer);
+    const tx = await router.exactInputSingle(
+      [trade.tokenAddr, trade.quoteToken, trade.fee, userAddress, sellAmount, minOut, 0]
+    );
+    log('live', `Sell submitted: ${tx.hash}`);
+    await tx.wait();
+    log('live', `Sell confirmed: ${tx.hash} (${reason})`);
+    trade.sold = true;
+    trade.soldTxHash = tx.hash;
+    renderTrades();
+  } catch(e){
+    log('err', `Auto-sell failed for ${trade.symbol}: ` + (e.shortMessage || e.message));
+  }
+}
+
+// Checks every open (non-dry-run, not-yet-sold) position against the stop-loss /
+// take-profit thresholds and fires sellToken() for anything that has crossed a line.
+// Relies on trade.currentPriceUsd, so call refreshPerformance() (or let it run) first.
+async function checkAutoSell(){
+  if (!$('autoSellEnabled').checked) return;
+  if (dryRun) return;                      // auto-sell only makes sense once you're LIVE
+  const stopLossPct = Number($('stopLossPct').value || 10);
+  const takeProfitPct = Number($('takeProfitPct').value || 25);
+  for (const t of trades){
+    if (t.sold || t.dryRun) continue;
+    if (!t.entryPriceUsd || !t.currentPriceUsd) continue;   // no price data yet, skip
+    const pct = (t.currentPriceUsd - t.entryPriceUsd) / t.entryPriceUsd * 100;
+    if (pct <= -Math.abs(stopLossPct)){
+      await sellToken(t, `stop-loss hit: ${pct.toFixed(2)}%`);
+    } else if (pct >= Math.abs(takeProfitPct)){
+      await sellToken(t, `take-profit hit: +${pct.toFixed(2)}%`);
+    }
+  }
 }
 
 async function refreshPerformance(){
@@ -1367,7 +1585,7 @@ function renderTrades(){
     const pctColor = pct == null ? 'var(--ink-faint)' : (pct >= 0 ? 'var(--green)' : 'var(--red)');
     tr.innerHTML = `<td class="mono">${timeStr}</td>` +
       `<td class="mono">${t.whale.slice(0,8)}…</td>` +
-      `<td class="label">${t.symbol}${t.dryRun ? ' (dry)' : ''}</td>` +
+      `<td class="label">${t.symbol}${t.historical ? ' (PAST)' : (t.dryRun ? ' (dry)' : '')}${t.sold && !t.historical ? ' · SOLD' : ''}</td>` +
       `<td class="num mono">${t.entryPriceUsd ? '$' + t.entryPriceUsd.toPrecision(4) : '—'}</td>` +
       `<td class="num mono">${t.currentPriceUsd ? '$' + t.currentPriceUsd.toPrecision(4) : '—'}</td>` +
       `<td class="num mono" style="color:${pctColor}">${pctStr}</td>` +
