@@ -797,9 +797,24 @@ async function getTokenUsdPrice(tokenAddr){
 async function bs(path, params){
   const url = new URL(BLOCKSCOUT + path);
   if (params) Object.entries(params).forEach(([k,v]) => url.searchParams.set(k,v));
-  const r = await fetch(url);
-  if (!r.ok) throw new Error('Blockscout ' + r.status);
-  return r.json();
+  // Blockscout's public API rate-limits aggressively (429) once a caller fires
+  // off more than a handful of requests per second — which is exactly what
+  // looping over 25-100 whales back-to-back does. Retry with backoff instead
+  // of failing outright, honoring Retry-After when the server sends one.
+  const maxAttempts = 5;
+  for (let attempt = 1; attempt <= maxAttempts; attempt++){
+    const r = await fetch(url);
+    if (r.status !== 429) {
+      if (!r.ok) throw new Error('Blockscout ' + r.status);
+      return r.json();
+    }
+    if (attempt === maxAttempts) throw new Error('Blockscout 429 (rate limited) after ' + maxAttempts + ' attempts');
+    const retryAfterHeader = Number(r.headers.get('retry-after'));
+    const backoffMs = !isNaN(retryAfterHeader) && retryAfterHeader > 0
+      ? retryAfterHeader * 1000
+      : 500 * Math.pow(2, attempt - 1); // 500ms, 1s, 2s, 4s
+    await sleep(backoffMs);
+  }
 }
 
 async function loadWhales(limit){
@@ -875,6 +890,7 @@ async function buildAnalytics(){
     } catch(e){ /* skip wallet on error, keep going */ }
     done++;
     $('coinSub').textContent = `scanning wallet ${done}/${whales.length}…`;
+    await sleep(150); // small gap between whales so we don't trip Blockscout's rate limit in the first place
   }
 
   const ranked = Object.values(stats).sort((a,b) => b.holders - a.holders).slice(0, 30);
