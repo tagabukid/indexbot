@@ -276,6 +276,14 @@
   .tag-sys{ color: #6FB8E0; }
   .tag-buy{ color: var(--green); font-weight:600; }
 
+  .size-mode-btn{
+    background: transparent; border:1px solid var(--border); color: var(--ink-dim);
+    padding: 7px 14px; border-radius: 999px; font-size:12.5px; font-weight:600;
+    font-family: var(--font-body); cursor:pointer; transition: all .15s ease;
+  }
+  .size-mode-btn.active{ background: var(--green); color:#06150D; border-color: var(--green); }
+  .size-mode-btn:not(.active):hover{ border-color: var(--green); color: var(--green); }
+
   /* ---------- Bottom CTA ---------- */
   .cta-banner{
     display:flex; align-items:center; justify-content:space-between; gap: 30px;
@@ -327,6 +335,7 @@
     <a href="#wallets">Wallets</a>
     <a href="#analytics">Analytics</a>
     <a href="#settings">Settings</a>
+    <a href="#performance">Performance</a>
     <a href="#activity">Activity</a>
   </div>
   <div class="nav-right">
@@ -421,16 +430,28 @@
         <div style="position:relative; height:260px;"><canvas id="coinChart"></canvas></div>
       </div>
     </div>
-    <div style="padding:16px 18px;">
+    <div style="padding:16px 18px; display:flex; gap:18px; align-items:center; flex-wrap:wrap;">
       <button id="analyticsBtn" class="btn-secondary" disabled>Build coin analytics</button>
+      <label style="display:flex; align-items:center; gap:8px; font-size:12.5px; color:var(--ink-dim);">
+        <input type="checkbox" id="autoAnalytics" style="accent-color:var(--green);">
+        Auto-rebuild while watching, every
+        <input id="analyticsInterval" type="number" value="60" min="15" class="num-input" style="width:60px; padding:6px 8px;">
+        sec
+      </label>
     </div>
   </section>
 
   <section class="card" id="settings">
     <div class="card-head"><h4>Copy-trade settings</h4><span class="sub" style="font-size:12px; color:var(--ink-faint);">tune sizing before you ever flip to live</span></div>
+    <div style="padding:0 18px 16px; display:flex; align-items:center; gap:10px;">
+      <span style="font-size:11.5px; color:var(--ink-faint);">Trade sizing</span>
+      <button type="button" id="sizeModeRatio" class="size-mode-btn active">% of balance</button>
+      <button type="button" id="sizeModeFixed" class="size-mode-btn">Fixed USD amount</button>
+    </div>
     <div class="controls">
-      <div class="field"><label>Copy ratio (of your balance)</label><input id="copyRatio" type="number" value="1" step="0.5"> %</div>
-      <div class="field"><label>Max trade size</label><input id="maxTrade" type="number" value="50"> USD</div>
+      <div class="field" id="ratioField"><label>Copy ratio (of your balance)</label><input id="copyRatio" type="number" value="1" step="0.5"> %</div>
+      <div class="field" id="fixedField" style="display:none;"><label>Fixed amount per trade</label><input id="fixedUsd" type="number" value="5" step="0.5" min="0.01"> USD</div>
+      <div class="field" id="maxTradeField"><label>Max trade size</label><input id="maxTrade" type="number" value="50"> USD</div>
       <div class="field"><label>Slippage tolerance</label><input id="slippage" type="number" value="1" step="0.1"> %</div>
       <div class="field"><label>Poll interval</label><input id="pollInterval" type="number" value="15"> sec</div>
     </div>
@@ -440,6 +461,26 @@
         <span class="mode-label dry" id="modeLabel">DRY RUN — no real trades will be sent</span>
       </div>
       <button id="startBtn" disabled>Load whale data first</button>
+    </div>
+  </section>
+
+  <section class="card" id="performance">
+    <div class="card-head">
+      <h4>Trade performance</h4>
+      <span class="sub" style="font-size:12px; color:var(--ink-faint);">win/loss based on token price since each copy signal</span>
+    </div>
+    <div style="display:flex; gap:30px; padding:6px 18px 4px;">
+      <div class="session-stat" style="flex:1; border:none; padding:10px 0;"><span class="sl">Trades tracked</span><span class="sv" id="statTradesTracked">0</span></div>
+      <div class="session-stat" style="flex:1; border:none; padding:10px 0;"><span class="sl">Win rate</span><span class="sv" id="statWinRate">—</span></div>
+    </div>
+    <table>
+      <thead><tr><th>Time</th><th>Whale</th><th>Token</th><th class="num">Entry $</th><th class="num">Now $</th><th class="num">Change</th><th class="num">Result</th></tr></thead>
+      <tbody id="tradeTable">
+        <tr><td colspan="7" class="empty-row">No copy trades tracked yet — start watching to begin tracking.</td></tr>
+      </tbody>
+    </table>
+    <div style="padding:16px 18px;">
+      <button id="perfBtn" class="btn-secondary">Refresh performance</button>
     </div>
   </section>
 
@@ -470,7 +511,6 @@
 </footer>
 
 <script src="https://cdnjs.cloudflare.com/ajax/libs/ethers/6.13.1/ethers.umd.min.js"></script>
-<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.4/chart.umd.min.js"></script>
 
 <script type="module">
   // ---------- Reown AppKit (WalletConnect) ----------
@@ -529,6 +569,8 @@ let provider = null, signer = null, userAddress = null;
 let whales = [];
 let watching = false;
 let dryRun = true;
+let sizingMode = 'ratio'; // 'ratio' | 'fixed'
+let trades = [];
 let swapCount = 0;
 let seenTx = {};
 let knownTokens = {};   // whale address -> Set(token address) already held/seen
@@ -713,7 +755,10 @@ function renderWhales(){
   });
 }
 
+let analyticsBusy = false;
 async function buildAnalytics(){
+  if (analyticsBusy) return;                     // manual click and auto-refresh can't overlap
+  analyticsBusy = true;
   $('analyticsBtn').disabled = true;
   $('analyticsBtn').textContent = 'Building…';
   const stats = {};
@@ -754,39 +799,91 @@ async function buildAnalytics(){
   $('coinSub').textContent = 'how many whales hold each coin, and how much';
   $('analyticsBtn').disabled = false;
   $('analyticsBtn').textContent = 'Rebuild coin analytics';
-  renderCoinChart(ranked.slice(0, 10));
+  window.__lastRanked = ranked.slice(0, 10);
+  renderCoinChart(window.__lastRanked);
   log('sys', `Analytics built across ${Object.keys(stats).length} coins.`);
+  analyticsBusy = false;
 }
 
-let coinChart = null;
+// Hand-drawn canvas bar chart — no external library, so it never depends on a
+// CDN load succeeding (that's why the chart was blank before: Chart.js failed
+// to load and the old code silently gave up).
+function roundTopRect(ctx, x, y, w, h, r){
+  r = Math.min(r, h, w/2);
+  ctx.beginPath();
+  ctx.moveTo(x, y + h);
+  ctx.lineTo(x, y + r);
+  ctx.arcTo(x, y, x + r, y, r);
+  ctx.lineTo(x + w - r, y);
+  ctx.arcTo(x + w, y, x + w, y + r, r);
+  ctx.lineTo(x + w, y + h);
+  ctx.closePath();
+}
+
 function renderCoinChart(top){
-  const ctx = $('coinChart');
-  if (!ctx || typeof Chart === 'undefined') return;   // CDN blocked/offline — skip gracefully
-  if (coinChart) coinChart.destroy();
-  coinChart = new Chart(ctx, {
-    type: 'bar',
-    data: {
-      labels: top.map(t => t.symbol || '?'),
-      datasets: [{
-        label: '# whales holding',
-        data: top.map(t => t.holders),
-        backgroundColor: 'rgba(43,224,126,0.55)',
-        borderColor: '#2BE07E',
-        borderWidth: 1,
-        borderRadius: 4,
-      }]
-    },
-    options: {
-      responsive: true,
-      maintainAspectRatio: false,
-      plugins: { legend: { display: false } },
-      scales: {
-        x: { ticks: { color: '#93A29B', font: { family: 'IBM Plex Mono' } }, grid: { display: false } },
-        y: { beginAtZero: true, ticks: { color: '#93A29B', precision: 0 }, grid: { color: '#1C2A24' } },
-      }
-    }
+  const canvas = $('coinChart');
+  if (!canvas) return;
+  const wrap = canvas.parentElement;
+  const cssW = Math.max(wrap.clientWidth || 280, 200);
+  const cssH = 260;
+  const dpr = window.devicePixelRatio || 1;
+  canvas.width = cssW * dpr;
+  canvas.height = cssH * dpr;
+  canvas.style.width = cssW + 'px';
+  canvas.style.height = cssH + 'px';
+  const ctx = canvas.getContext('2d');
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.clearRect(0, 0, cssW, cssH);
+
+  if (!top.length){
+    ctx.fillStyle = '#5B6863';
+    ctx.font = '13px Inter, sans-serif';
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.fillText('No data yet — build analytics first', cssW/2, cssH/2);
+    return;
+  }
+
+  const padL = 30, padR = 8, padT = 10, padB = 40;
+  const plotW = cssW - padL - padR, plotH = cssH - padT - padB;
+  const maxVal = Math.max(...top.map(t => t.holders), 1);
+  const gap = 10;
+  const barW = Math.max((plotW - gap * (top.length - 1)) / top.length, 4);
+
+  ctx.strokeStyle = '#1C2A24';
+  ctx.fillStyle = '#93A29B';
+  ctx.font = '10px "IBM Plex Mono", monospace';
+  ctx.textAlign = 'right';
+  ctx.textBaseline = 'middle';
+  ctx.lineWidth = 1;
+  const gridSteps = 4;
+  for (let i = 0; i <= gridSteps; i++){
+    const v = Math.round(maxVal * i / gridSteps);
+    const y = padT + plotH - (plotH * i / gridSteps);
+    ctx.beginPath(); ctx.moveTo(padL, y); ctx.lineTo(cssW - padR, y); ctx.stroke();
+    ctx.fillText(String(v), padL - 6, y);
+  }
+
+  top.forEach((t, i) => {
+    const x = padL + i * (barW + gap);
+    const barH = (t.holders / maxVal) * plotH;
+    const y = padT + plotH - barH;
+    ctx.fillStyle = 'rgba(43,224,126,0.55)';
+    ctx.strokeStyle = '#2BE07E';
+    roundTopRect(ctx, x, y, barW, barH, 4);
+    ctx.fill(); ctx.stroke();
+
+    ctx.fillStyle = '#93A29B';
+    ctx.font = '10px "IBM Plex Mono", monospace';
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'top';
+    let label = t.symbol || '?';
+    if (label.length > 7) label = label.slice(0, 6) + '…';
+    ctx.fillText(label, x + barW/2, padT + plotH + 8);
   });
 }
+
+window.addEventListener('resize', () => { if (window.__lastRanked) renderCoinChart(window.__lastRanked); });
 
 $('loadBtn').addEventListener('click', () => loadWhales(Number($('whaleCount').value)||25));
 $('analyticsBtn').addEventListener('click', buildAnalytics);
@@ -808,6 +905,17 @@ function setDryRun(v){
   log('sys', `Mode switched to ${dryRun ? 'DRY RUN' : 'LIVE'}.`);
 }
 
+function setSizingMode(mode){
+  sizingMode = mode;
+  $('sizeModeRatio').classList.toggle('active', mode === 'ratio');
+  $('sizeModeFixed').classList.toggle('active', mode === 'fixed');
+  $('ratioField').style.display = mode === 'ratio' ? '' : 'none';
+  $('maxTradeField').style.display = mode === 'ratio' ? '' : 'none';
+  $('fixedField').style.display = mode === 'fixed' ? '' : 'none';
+}
+$('sizeModeRatio').addEventListener('click', () => setSizingMode('ratio'));
+$('sizeModeFixed').addEventListener('click', () => setSizingMode('fixed'));
+
 $('modeToggle').addEventListener('click', () => {
   if (dryRun){
     if (!signer){ log('err', 'Connect a wallet before switching to LIVE.'); return; }
@@ -822,6 +930,7 @@ $('startBtn').addEventListener('click', () => {
     watching = false;
     $('startBtn').textContent = 'Start watching';
     log('sys', 'Stopped watching.');
+    stopAutoAnalytics();
     return;
   }
   if (whales.length === 0){ log('err', 'Load whale data first.'); return; }
@@ -829,6 +938,29 @@ $('startBtn').addEventListener('click', () => {
   $('startBtn').textContent = 'Stop watching';
   log('sys', `Watching ${whales.length} wallets every ${$('pollInterval').value}s for swaps…`);
   watchLoop();
+  if ($('autoAnalytics').checked) startAutoAnalytics();
+});
+
+// ---------- Auto-refresh analytics while watching ----------
+let analyticsTimer = null;
+function startAutoAnalytics(){
+  if (analyticsTimer) return;                    // already running
+  const iv = Math.max(Number($('analyticsInterval').value || 60), 15) * 1000;
+  log('sys', `Auto-rebuild of analytics enabled, every ${iv/1000}s.`);
+  analyticsTimer = setInterval(() => {
+    if (!watching || whales.length === 0) return;
+    buildAnalytics();                             // no-ops itself if already busy
+  }, iv);
+}
+function stopAutoAnalytics(){
+  if (analyticsTimer){ clearInterval(analyticsTimer); analyticsTimer = null; }
+}
+$('autoAnalytics').addEventListener('change', () => {
+  if ($('autoAnalytics').checked && watching) startAutoAnalytics();
+  else stopAutoAnalytics();
+});
+$('analyticsInterval').addEventListener('change', () => {
+  if (analyticsTimer){ stopAutoAnalytics(); startAutoAnalytics(); }   // apply new interval live
 });
 
 let loopId = 0;
@@ -963,20 +1095,36 @@ async function handleSwap(whaleAddr, swap){
       myBal = ethBal > GAS_RESERVE ? ethBal - GAS_RESERVE : 0n;
       useNative = true;
     }
-    const ratio = Number($('copyRatio').value||1) / 100;
-    let amountIn = (myBal * BigInt(Math.floor(ratio*10000))) / 10000n;
-
+    const decimals = Number(await token.decimals());
     const priceUsd = await getTokenUsdPrice(swap.tokenIn);
-    if (priceUsd && priceUsd > 0){
-      const decimals = Number(await token.decimals());
-      const maxUsd = Number($('maxTrade').value||50);
-      const capAmount = ethers.parseUnits((maxUsd / priceUsd).toFixed(decimals), decimals);
-      if (capAmount < amountIn){
-        amountIn = capAmount;
-        log('plan', `MAX_TRADE_USD cap applied: capped to ${maxUsd} USD worth (~$${priceUsd} per token).`);
+    let amountIn;
+
+    if (sizingMode === 'fixed'){
+      const fixedUsd = Number($('fixedUsd').value || 5);
+      if (!priceUsd || priceUsd <= 0){
+        log('skip', 'No USD price found for this token — cannot size a fixed-USD trade, skipping.');
+        return;
+      }
+      amountIn = ethers.parseUnits((fixedUsd / priceUsd).toFixed(decimals), decimals);
+      if (amountIn > myBal){
+        log('plan', `Fixed $${fixedUsd} needs more than you hold — capped to your available balance.`);
+        amountIn = myBal;
+      } else {
+        log('plan', `Fixed-USD sizing: ~$${fixedUsd} worth (~$${priceUsd} per token).`);
       }
     } else {
-      log('skip', 'No USD price found for this token — MAX_TRADE_USD cap not enforced, using ratio only.');
+      const ratio = Number($('copyRatio').value||1) / 100;
+      amountIn = (myBal * BigInt(Math.floor(ratio*10000))) / 10000n;
+      if (priceUsd && priceUsd > 0){
+        const maxUsd = Number($('maxTrade').value||50);
+        const capAmount = ethers.parseUnits((maxUsd / priceUsd).toFixed(decimals), decimals);
+        if (capAmount < amountIn){
+          amountIn = capAmount;
+          log('plan', `MAX_TRADE_USD cap applied: capped to ${maxUsd} USD worth (~$${priceUsd} per token).`);
+        }
+      } else {
+        log('skip', 'No USD price found for this token — MAX_TRADE_USD cap not enforced, using ratio only.');
+      }
     }
 
     if (amountIn === 0n){
@@ -990,6 +1138,7 @@ async function handleSwap(whaleAddr, swap){
     const minOut = (expectedOut * BigInt(10000 - slipBps)) / 10000n;
 
     log('plan', `Copy plan: ${useNative ? 'native ETH' : 'token'} amountIn=${amountIn} expectedOut=${expectedOut} minOut=${minOut}`);
+    await recordTrade(whaleAddr, swap, expectedOut, dryRun);   // track for win/loss, dry run or live
 
     if (dryRun){
       log('plan', 'DRY RUN — no transaction sent.');
@@ -1020,6 +1169,76 @@ async function handleSwap(whaleAddr, swap){
 }
 
 function sleep(ms){ return new Promise(r => setTimeout(r, ms)); }
+
+// ---------- Trade performance (win/loss) ----------
+async function recordTrade(whaleAddr, swap, amountOut, isDryRun){
+  try {
+    const meta = await getTokenMeta(swap.tokenOut);
+    const outToken = new ethers.Contract(swap.tokenOut, ERC20_ABI, provider);
+    const outDec = Number(await outToken.decimals());
+    const amountOutHuman = Number(amountOut) / Math.pow(10, outDec);
+    const entryPriceUsd = await getTokenUsdPrice(swap.tokenOut);
+    trades.unshift({
+      time: Date.now(), whale: whaleAddr, symbol: meta.symbol, name: meta.name,
+      tokenAddr: swap.tokenOut, amountOut: amountOutHuman,
+      entryPriceUsd, currentPriceUsd: entryPriceUsd, dryRun: isDryRun, txHash: swap.txHash,
+    });
+    if (trades.length > 200) trades.length = 200;   // cap memory
+    renderTrades();
+  } catch(e){ /* skip tracking this one, doesn't affect the copy trade itself */ }
+}
+
+async function refreshPerformance(){
+  if (trades.length === 0) return;
+  $('perfBtn').disabled = true;
+  $('perfBtn').textContent = 'Refreshing…';
+  const uniqueTokens = [...new Set(trades.map(t => t.tokenAddr))];
+  const priceMap = {};
+  for (const addr of uniqueTokens){ priceMap[addr] = await getTokenUsdPrice(addr); }
+  trades.forEach(t => { if (priceMap[t.tokenAddr] != null) t.currentPriceUsd = priceMap[t.tokenAddr]; });
+  renderTrades();
+  $('perfBtn').disabled = false;
+  $('perfBtn').textContent = 'Refresh performance';
+  log('sys', `Performance refreshed across ${uniqueTokens.length} token(s).`);
+}
+
+function renderTrades(){
+  const tbody = $('tradeTable');
+  tbody.innerHTML = '';
+  if (trades.length === 0){
+    tbody.innerHTML = '<tr><td colspan="7" class="empty-row">No copy trades tracked yet — start watching to begin tracking.</td></tr>';
+    $('statTradesTracked').textContent = '0';
+    $('statWinRate').textContent = '—';
+    return;
+  }
+  let wins = 0, losses = 0, known = 0;
+  trades.forEach(t => {
+    let pct = null, resultLabel = 'PENDING', resultClass = 'label';
+    if (t.entryPriceUsd && t.currentPriceUsd){
+      pct = (t.currentPriceUsd - t.entryPriceUsd) / t.entryPriceUsd * 100;
+      known++;
+      if (pct > 0){ wins++; resultLabel = 'WIN'; resultClass = 'mono tag-signal'; }
+      else if (pct < 0){ losses++; resultLabel = 'LOSS'; resultClass = 'mono tag-err'; }
+      else { resultLabel = 'FLAT'; resultClass = 'mono'; }
+    }
+    const tr = document.createElement('tr');
+    const timeStr = new Date(t.time).toLocaleTimeString();
+    const pctStr = pct == null ? '—' : (pct >= 0 ? '+' : '') + pct.toFixed(2) + '%';
+    const pctColor = pct == null ? 'var(--ink-faint)' : (pct >= 0 ? 'var(--green)' : 'var(--red)');
+    tr.innerHTML = `<td class="mono">${timeStr}</td>` +
+      `<td class="mono">${t.whale.slice(0,8)}…</td>` +
+      `<td class="label">${t.symbol}${t.dryRun ? ' (dry)' : ''}</td>` +
+      `<td class="num mono">${t.entryPriceUsd ? '$' + t.entryPriceUsd.toPrecision(4) : '—'}</td>` +
+      `<td class="num mono">${t.currentPriceUsd ? '$' + t.currentPriceUsd.toPrecision(4) : '—'}</td>` +
+      `<td class="num mono" style="color:${pctColor}">${pctStr}</td>` +
+      `<td class="num ${resultClass}">${resultLabel}</td>`;
+    tbody.appendChild(tr);
+  });
+  $('statTradesTracked').textContent = trades.length;
+  $('statWinRate').textContent = known ? `${(wins/known*100).toFixed(0)}% (${wins}W / ${losses}L)` : '—';
+}
+
+$('perfBtn').addEventListener('click', refreshPerformance);
 </script>
 
 </body>
