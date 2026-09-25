@@ -512,45 +512,111 @@
 
 <script src="https://cdnjs.cloudflare.com/ajax/libs/ethers/6.13.1/ethers.umd.min.js"></script>
 
+<script>
+  // ---------- Early environment check ----------
+  // WalletConnect/Reown (and most wallet browser extensions) require a secure
+  // context: https:// or http://localhost. Opening this file directly on a
+  // phone (file://...) — e.g. tapping it in Files/Downloads — will silently
+  // break wallet connect, and on top of that many mobile browsers refuse to
+  // load ES module imports (see below) from a file:// origin at all.
+  window.__walletEnvOk = true;
+  if (location.protocol === 'file:') {
+    window.__walletEnvOk = false;
+    window.addEventListener('DOMContentLoaded', () => {
+      const btn = document.getElementById('connectBtn');
+      if (btn) {
+        btn.disabled = true;
+        btn.title = 'Wallet connect needs HTTPS hosting — see the log below.';
+      }
+      const logFn = window.log; // defined later in the classic script; safe fallback below
+      const msg = 'Opened via file:// — wallet connect will NOT work here. ' +
+        'Host this file on HTTPS (or http://localhost while testing) and open it ' +
+        'through that URL instead of opening the file directly.';
+      if (typeof logFn === 'function') {
+        logFn('err', msg);
+      } else {
+        // log() isn't defined yet this early — retry shortly after the rest of the page loads
+        setTimeout(() => { if (typeof window.log === 'function') window.log('err', msg); }, 500);
+      }
+    });
+  }
+</script>
+
 <script type="module">
   // ---------- Reown AppKit (WalletConnect) ----------
   // 1. Get a free Project ID at https://dashboard.reown.com and paste it below.
+  // 2. In the Reown dashboard, add every domain you'll actually open this
+  //    page from (e.g. your-site.com, and localhost while testing) under
+  //    that project's "Allowed domains" — otherwise the modal can fail to
+  //    connect even when everything else here is correct.
   const REOWN_PROJECT_ID = 'b0c63708e6e05037ff90672a5c1b54a3';
 
-  import { createAppKit, defineChain } from 'https://esm.sh/@reown/appkit';
-  import { EthersAdapter } from 'https://esm.sh/@reown/appkit-adapter-ethers';
+  async function initReown(){
+    if (!window.__walletEnvOk) return; // already warned above, don't even try
 
-  const robinhoodChain = defineChain({
-    id: 4663,
-    caipNetworkId: 'eip155:4663',
-    chainNamespace: 'eip155',
-    name: 'Robinhood Chain',
-    nativeCurrency: { name: 'ETH', symbol: 'ETH', decimals: 18 },
-    rpcUrls: { default: { http: ['https://rpc.mainnet.chain.robinhood.com'] } },
-    blockExplorers: { default: { name: 'Blockscout', url: 'https://robinhoodchain.blockscout.com' } },
-  });
+    let createAppKit, defineChain, EthersAdapter;
+    try {
+      ({ createAppKit, defineChain } = await import('https://esm.sh/@reown/appkit'));
+      ({ EthersAdapter } = await import('https://esm.sh/@reown/appkit-adapter-ethers'));
+    } catch (err) {
+      const msg = 'Failed to load Reown AppKit module (' + (err && err.message ? err.message : err) +
+        '). This usually means no internet access to esm.sh, an ad/script blocker, ' +
+        'or a browser that blocks module imports in this context.';
+      if (typeof window.log === 'function') window.log('err', msg);
+      else setTimeout(() => { if (typeof window.log === 'function') window.log('err', msg); }, 500);
+      return;
+    }
 
-  const appKit = createAppKit({
-    adapters: [new EthersAdapter()],
-    networks: [robinhoodChain],
-    defaultNetwork: robinhoodChain,
-    projectId: REOWN_PROJECT_ID,
-    metadata: {
-      name: 'IndexBot — Robinhood Chain Whale Tracker',
-      description: 'Whale tracking and copy-trade dashboard for Robinhood Chain',
-      url: window.location.origin,
-      icons: [],
-    },
-  });
+    const robinhoodChain = defineChain({
+      id: 4663,
+      caipNetworkId: 'eip155:4663',
+      chainNamespace: 'eip155',
+      name: 'Robinhood Chain',
+      nativeCurrency: { name: 'ETH', symbol: 'ETH', decimals: 18 },
+      rpcUrls: { default: { http: ['https://rpc.mainnet.chain.robinhood.com'] } },
+      blockExplorers: { default: { name: 'Blockscout', url: 'https://robinhoodchain.blockscout.com' } },
+    });
 
-  // Exposed to the classic script below. The modal only opens here; the classic
-  // script learns about connect AND disconnect through the 'reown-provider'
-  // event, so it also stays in sync if the user disconnects from inside the wallet.
-  window.connectViaReown = () => appKit.open();
-  window.disconnectViaReown = () => appKit.disconnect();
-  appKit.subscribeProviders((state) => {
-    window.dispatchEvent(new CustomEvent('reown-provider', { detail: state['eip155'] || null }));
-  });
+    // window.location.origin is "null" or "file://" in broken contexts —
+    // fall back to something valid so createAppKit doesn't choke on it.
+    const safeOrigin = (window.location.origin && window.location.origin !== 'null')
+      ? window.location.origin
+      : 'https://localhost';
+
+    let appKit;
+    try {
+      appKit = createAppKit({
+        adapters: [new EthersAdapter()],
+        networks: [robinhoodChain],
+        defaultNetwork: robinhoodChain,
+        projectId: REOWN_PROJECT_ID,
+        metadata: {
+          name: 'IndexBot — Robinhood Chain Whale Tracker',
+          description: 'Whale tracking and copy-trade dashboard for Robinhood Chain',
+          url: safeOrigin,
+          icons: [],
+        },
+      });
+    } catch (err) {
+      const msg = 'createAppKit() threw: ' + (err && err.message ? err.message : err);
+      if (typeof window.log === 'function') window.log('err', msg);
+      return;
+    }
+
+    // Exposed to the classic script below. The modal only opens here; the classic
+    // script learns about connect AND disconnect through the 'reown-provider'
+    // event, so it also stays in sync if the user disconnects from inside the wallet.
+    window.connectViaReown = () => appKit.open();
+    window.disconnectViaReown = () => appKit.disconnect();
+    appKit.subscribeProviders((state) => {
+      window.dispatchEvent(new CustomEvent('reown-provider', { detail: state['eip155'] || null }));
+    });
+
+    if (typeof window.log === 'function') window.log('sys', 'Reown AppKit ready.');
+    else setTimeout(() => { if (typeof window.log === 'function') window.log('sys', 'Reown AppKit ready.'); }, 500);
+  }
+
+  initReown();
 </script>
 
 <script>
@@ -660,8 +726,12 @@ $('connectBtn').addEventListener('click', async () => {
       window.connectViaReown();
       return;
     }
+    if (window.__walletEnvOk === false){
+      log('err', 'Page was opened via file:// — host it on HTTPS (or localhost) and open it through that URL instead.');
+      return;
+    }
     if (!window.ethereum){
-      log('err', 'No browser wallet found, and Reown did not load. Install MetaMask (or similar) and reload.');
+      log('err', 'No browser wallet found, and Reown either failed to load or is still loading — check earlier log lines above for the specific error, then try again in a few seconds.');
       return;
     }
     await window.ethereum.request({ method: 'eth_requestAccounts' });
